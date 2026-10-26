@@ -15,7 +15,7 @@
  * the system fell back to.
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
+import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AuditReport } from '../audit.ts'
@@ -176,6 +176,37 @@ export function ContextAuditRing(props: ContextAuditRingProps): ReactElement {
   const [expanded, setExpanded] = useState<Segment['key'] | null>(null)
   const panelId = useId()
   const dockRef = useRef<HTMLSpanElement | null>(null)
+
+  /**
+   * 面板高度上限，按真实可用空间算。
+   *
+   * 面板锚在输入框（dock）上方，能用的高度是「dock 顶部 → 视口顶部」，
+   * 而不是视口高度的某个百分比：窗口越矮、或插件越多导致面板内容越高，
+   * `70vh` 就越会超出这个空间，header 被顶出视口。面板自身的 `overflow`
+   * 也救不回来——溢出的是它自己的盒子，滚动只滚内容，盒子顶部不动。
+   *
+   * undefined 表示尚未测量（首帧），此时沿用样式表里的保守默认值。
+   */
+  const [panelMaxHeight, setPanelMaxHeight] = useState<number | undefined>(undefined)
+  useLayoutEffect(() => {
+    if (!open) return undefined
+    const measure = (): void => {
+      const dock = dockRef.current
+      if (dock === null) return
+      // dock 顶部往下留 12px 与输入框的间距，再留 12px 视口边距。
+      const available = dock.getBoundingClientRect().top - 24
+      // 上限取三者最小：70vh、620px、真实可用高度。
+      //
+      // 这里刻意**不设下限**：任何下限一旦超过 available，面板顶部又会越过视口
+      // 上沿，而溢出的是面板自己的盒子——内部滚动只能滚内容，救不回 header。
+      // 可用空间极小时就让它缩到极小并内部滚动，也好过显示一个「看起来正常、
+      // 实际少了顶部」的面板。
+      setPanelMaxHeight(Math.max(0, Math.min(window.innerHeight * 0.7, 620, available)))
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [open])
   const controllerRef = useRef<AbortController | null>(null)
 
   const refresh = useCallback(() => {
@@ -202,10 +233,18 @@ export function ContextAuditRing(props: ContextAuditRingProps): ReactElement {
     })
   }, [actions, sessionId])
 
+  // 挂载时取一次，喂给触发器上的状态色。
   useEffect(() => {
     refresh()
     return () => controllerRef.current?.abort()
   }, [refresh])
+
+  // 打开面板再取一次。数据是审计快照，只靠挂载取数的话，面板显示的永远是
+  // 「组件挂载那一刻」的读数——用户几分钟后打开看到的就是过期数字，
+  // 必须手点刷新（issue #14）。取数很轻（宿主侧还有 60s 缓存），打开即取。
+  useEffect(() => {
+    if (open) refresh()
+  }, [open, refresh])
 
   // Dismiss on Escape or on any pointer landing outside the control.
   useEffect(() => {
@@ -262,7 +301,8 @@ export function ContextAuditRing(props: ContextAuditRingProps): ReactElement {
       <PulseIcon size={16} />
     </button>
 
-    {open && <section id={panelId} role="dialog" aria-label={t('cd.title')} style={panelStyle}>
+    {open && <section id={panelId} role="dialog" aria-label={t('cd.title')}
+      style={panelMaxHeight === undefined ? panelStyle : { ...panelStyle, maxHeight: panelMaxHeight }}>
       <header style={headStyle}>
         <span style={eyebrowStyle}>{t('cd.title')}</span>
         <span style={{ ...statusStyle, color: accent }}>
@@ -291,10 +331,19 @@ export function ContextAuditRing(props: ContextAuditRingProps): ReactElement {
                     height: '100%',
                   }} />)}
               </span>
-              {THRESHOLDS.map(threshold => <span key={threshold} aria-hidden="true"
-                style={{ ...tickStyle, left: `${(threshold / FULL_SCALE) * 100}%` }}>
-                <span style={tickLabelStyle}>{formatTokens(threshold)}</span>
-              </span>)}
+              {/*
+                刻线与标签都是轨道的**兄弟**节点，标签不嵌在 1px 宽的刻线里：
+                那样它的 shrink-to-fit 可用宽度只有 0.5px，宿主或其它插件只要带上
+                「最小内容宽度 = 一个字符」的全局规则（overflow-wrap: anywhere 之类），
+                标签就会逐字竖排成 6px 宽的窄条（issue #14）。
+              */}
+              {THRESHOLDS.map(threshold => {
+                const at = `${(threshold / FULL_SCALE) * 100}%`
+                return <Fragment key={threshold}>
+                  <span aria-hidden="true" style={{ ...tickStyle, left: at }} />
+                  <span aria-hidden="true" style={{ ...tickLabelStyle, left: at }}>{formatTokens(threshold)}</span>
+                </Fragment>
+              })}
             </div>
           </div>
 
@@ -382,7 +431,7 @@ const readPercentStyle: CSSProperties = { marginLeft: 'auto', color: TONE.muted,
 const railStyle: CSSProperties = { position: 'relative', height: 23, marginTop: 11 }
 const railTrackStyle: CSSProperties = { position: 'absolute', inset: '0 0 auto', display: 'flex', height: 8, overflow: 'hidden', background: TONE.sunk, borderRadius: 3 }
 const tickStyle: CSSProperties = { position: 'absolute', top: 0, width: 1, height: 12, background: TONE.borderStrong }
-const tickLabelStyle: CSSProperties = { position: 'absolute', top: 13, left: '50%', transform: 'translateX(-50%)', color: TONE.quiet, fontFamily: MONO, fontSize: 9.5, fontVariantNumeric: 'tabular-nums' }
+const tickLabelStyle: CSSProperties = { position: 'absolute', top: 13, transform: 'translateX(-50%)', whiteSpace: 'nowrap', color: TONE.quiet, fontFamily: MONO, fontSize: 9.5, fontVariantNumeric: 'tabular-nums' }
 
 const tableStyle: CSSProperties = { margin: '16px 0 0', padding: 0, listStyle: 'none', borderTop: `1px solid ${TONE.border}` }
 const rowStyle: CSSProperties = { display: 'grid', width: '100%', gridTemplateColumns: '3px minmax(0, 1fr) 62px 40px', alignItems: 'center', columnGap: 11, padding: '10px 16px', color: TONE.text, background: 'transparent', border: 0, borderBottom: `1px solid ${TONE.border}`, textAlign: 'left', font: 'inherit' }
